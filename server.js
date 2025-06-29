@@ -54,7 +54,7 @@ app.get('/api/tokens', (req, res) => {
   });
 });
 
-// Endpoint to send notification (updated to track usage)
+// Endpoint to send notification (complete version)
 app.post('/api/send-notification', async (req, res) => {
   const { 
     title = 'Test', 
@@ -63,32 +63,111 @@ app.post('/api/send-notification', async (req, res) => {
     targetToken = null // Optional: send to specific token
   } = req.body;
 
+  // Validate tokens storage
   if (tokensStorage.size === 0) {
-    return res.status(400).json({ error: 'No tokens available' });
+    return res.status(400).json({ 
+      success: false,
+      error: 'No tokens available in storage' 
+    });
   }
 
-  // Update last used timestamp for targeted token
-  if (targetToken && tokensStorage.has(targetToken)) {
-    tokensStorage.get(targetToken).lastUsed = new Date().toISOString();
+  // Validate target token if specified
+  if (targetToken && !tokensStorage.has(targetToken)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Specified token not found in storage'
+    });
   }
 
-  const messages = targetToken
-    ? [{
-        to: targetToken,
-        sound: 'default',
-        title,
-        body,
-        data
-      }]
-    : Array.from(tokensStorage.keys()).map(token => ({
-        to: token,
-        sound: 'default',
-        title,
-        body,
-        data
-      }));
+  try {
+    // Prepare messages
+    const messages = targetToken
+      ? [{
+          to: targetToken,
+          sound: 'default',
+          title,
+          body,
+          data,
+          _trackingId: `notif-${Date.now()}` // For tracking
+        }]
+      : Array.from(tokensStorage.keys()).map(token => ({
+          to: token,
+          sound: 'default',
+          title,
+          body,
+          data,
+          _trackingId: `notif-${Date.now()}-${token.slice(-4)}`
+        }));
 
-  // ... rest of the send notification code ...
+    // Chunk and send notifications
+    const chunks = expo.chunkPushNotifications(messages);
+    const tickets = [];
+    const receipts = [];
+
+    // Send all chunks
+    for (const chunk of chunks) {
+      try {
+        const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
+        tickets.push(...ticketChunk);
+      } catch (error) {
+        console.error('Error sending chunk:', error);
+        // Continue with remaining chunks
+      }
+    }
+
+    // Check receipts after a short delay (Expo recommends waiting)
+    if (tickets.length > 0) {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      
+      const receiptChunks = expo.chunkPushNotificationReceipts(
+        tickets.map(t => t.id)
+      );
+
+      for (const chunk of receiptChunks) {
+        try {
+          const receiptChunk = await expo.getPushNotificationReceiptsAsync(chunk);
+          receipts.push(...Object.values(receiptChunk));
+        } catch (error) {
+          console.error('Error checking receipts:', error);
+        }
+      }
+    }
+
+    // Update last used time for tokens
+    const usedTokens = targetToken ? [targetToken] : [...tokensStorage.keys()];
+    usedTokens.forEach(token => {
+      if (tokensStorage.has(token)) {
+        tokensStorage.get(token).lastUsed = new Date().toISOString();
+      }
+    });
+
+    // Format response
+    const result = {
+      success: true,
+      stats: {
+        attempted: messages.length,
+        sent: tickets.length,
+        failed: messages.length - tickets.length
+      },
+      receipts: receipts.map(r => ({
+        status: r?.status || 'unknown',
+        message: r?.message || '',
+        details: r?.details || null
+      })),
+      firstTicketId: tickets[0]?.id || null,
+      lastUsedTokens: usedTokens.slice(0, 3) // Show first 3 for reference
+    };
+
+    res.json(result);
+
+  } catch (error) {
+    console.error('Notification processing error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process notifications',
+      details: error.message
+    });
+  }
 });
 
 // Endpoint to store token
